@@ -1,9 +1,5 @@
-# This is a version of the main.py file found in ../../../server/main.py for testing the plugin locally.
-# Use the command `poetry run dev` to run this.
+import os
 from typing import Optional
-import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Body, UploadFile
-from loguru import logger
 
 from models.api import (
     DeleteRequest,
@@ -16,49 +12,7 @@ from models.api import (
 from datastore.factory import get_datastore
 from services.file import get_document_from_file
 
-from starlette.responses import FileResponse
-
 from models.models import DocumentMetadata, Source
-from fastapi.middleware.cors import CORSMiddleware
-
-
-app = FastAPI()
-
-PORT = 3333
-
-origins = [
-    f"http://localhost:{PORT}",
-    "https://chat.openai.com",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.route("/.well-known/ai-plugin.json")
-async def get_manifest(request):
-    file_path = "./local_server/ai-plugin.json"
-    simple_headers = {}
-    simple_headers["Access-Control-Allow-Private-Network"] = "true"
-    return FileResponse(file_path, media_type="text/json", headers=simple_headers)
-
-
-@app.route("/.well-known/logo.png")
-async def get_logo(request):
-    file_path = "./local_server/logo.png"
-    return FileResponse(file_path, media_type="text/json")
-
-
-@app.route("/.well-known/openapi.yaml")
-async def get_openapi(request):
-    file_path = "./local_server/openapi.yaml"
-    return FileResponse(file_path, media_type="text/json")
-
 
 @app.post(
     "/upsert-file",
@@ -98,19 +52,40 @@ async def upsert(
         ids = await datastore.upsert(request.documents)
         return UpsertResponse(ids=ids)
     except Exception as e:
-        logger.error(e)
         raise HTTPException(status_code=500, detail="Internal Service Error")
 
 
-@app.post("/query", response_model=QueryResponse)
-async def query_main(request: QueryRequest = Body(...)):
+@app.post(
+    "/query",
+    response_model=QueryResponse,
+)
+async def query_main(
+    request: QueryRequest = Body(...),
+):
     try:
         results = await datastore.query(
             request.queries,
         )
         return QueryResponse(results=results)
     except Exception as e:
-        logger.error(e)
+        raise HTTPException(status_code=500, detail="Internal Service Error")
+
+
+@sub_app.post(
+    "/query",
+    response_model=QueryResponse,
+    # NOTE: We are describing the shape of the API endpoint input due to a current limitation in parsing arrays of objects from OpenAPI schemas. This will not be necessary in the future.
+    description="Accepts search query objects array each with query and optional filter. Break down complex questions into sub-questions. Refine results by criteria, e.g. time / source, don't do this often. Split queries if ResponseTooLargeError occurs.",
+)
+async def query(
+    request: QueryRequest = Body(...),
+):
+    try:
+        results = await datastore.query(
+            request.queries,
+        )
+        return QueryResponse(results=results)
+    except Exception as e:
         raise HTTPException(status_code=500, detail="Internal Service Error")
 
 
@@ -134,7 +109,6 @@ async def delete(
         )
         return DeleteResponse(success=success)
     except Exception as e:
-        logger.error(e)
         raise HTTPException(status_code=500, detail="Internal Service Error")
 
 
@@ -145,4 +119,4 @@ async def startup():
 
 
 def start():
-    uvicorn.run("local_server.main:app", host="localhost", port=PORT, reload=True)
+    uvicorn.run("server.main:app", host="0.0.0.0", port=8000, reload=True)
