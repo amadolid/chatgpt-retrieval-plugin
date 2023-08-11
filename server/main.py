@@ -49,6 +49,7 @@ app.mount("/sub", sub_app)
     response_model=UpsertResponse,
 )
 async def upsert_file(
+    index_name: str = Form(None),
     file: UploadFile = File(...),
     metadata: Optional[str] = Form(None),
 ):
@@ -64,7 +65,7 @@ async def upsert_file(
     document = await get_document_from_file(file, metadata_obj)
 
     try:
-        ids = await datastore.upsert([document])
+        ids = await datastore.upsert([document], index_name=index_name)
         return UpsertResponse(ids=ids)
     except Exception as e:
         logger.error(e)
@@ -79,7 +80,7 @@ async def upsert(
     request: UpsertRequest = Body(...),
 ):
     try:
-        ids = await datastore.upsert(request.documents)
+        ids = await datastore.upsert(request.documents, index_name=request.index_name)
         return UpsertResponse(ids=ids)
     except Exception as e:
         logger.error(e)
@@ -96,6 +97,8 @@ async def query_main(
     try:
         results = await datastore.query(
             request.queries,
+            index_name=request.index_name,
+            embeddings=request.embeddings,
         )
         return QueryResponse(results=results)
     except Exception as e:
@@ -113,9 +116,7 @@ async def query(
     request: QueryRequest = Body(...),
 ):
     try:
-        results = await datastore.query(
-            request.queries,
-        )
+        results = await datastore.query(request.queries, index_name=request.index_name)
         return QueryResponse(results=results)
     except Exception as e:
         logger.error(e)
@@ -139,6 +140,7 @@ async def delete(
             ids=request.ids,
             filter=request.filter,
             delete_all=request.delete_all,
+            index_name=request.index_name,
         )
         return DeleteResponse(success=success)
     except Exception as e:
@@ -153,4 +155,9 @@ async def startup():
 
 
 def start():
-    uvicorn.run("server.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "server.main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT")) or 8000,
+        reload=True,
+    )

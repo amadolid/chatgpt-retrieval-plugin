@@ -16,7 +16,10 @@ from services.openai import get_embeddings
 
 class DataStore(ABC):
     async def upsert(
-        self, documents: List[Document], chunk_token_size: Optional[int] = None
+        self,
+        documents: List[Document],
+        chunk_token_size: Optional[int] = None,
+        **kwargs
     ) -> List[str]:
         """
         Takes in a list of documents and inserts them into the database.
@@ -31,6 +34,7 @@ class DataStore(ABC):
                         document_id=document.id,
                     ),
                     delete_all=False,
+                    index_name=kwargs.get("index_name"),
                 )
                 for document in documents
                 if document.id
@@ -39,10 +43,12 @@ class DataStore(ABC):
 
         chunks = get_document_chunks(documents, chunk_token_size)
 
-        return await self._upsert(chunks)
+        return await self._upsert(chunks, **kwargs)
 
     @abstractmethod
-    async def _upsert(self, chunks: Dict[str, List[DocumentChunk]]) -> List[str]:
+    async def _upsert(
+        self, chunks: Dict[str, List[DocumentChunk]], **kwargs
+    ) -> List[str]:
         """
         Takes in a list of list of document chunks and inserts them into the database.
         Return a list of document ids.
@@ -50,7 +56,7 @@ class DataStore(ABC):
 
         raise NotImplementedError
 
-    async def query(self, queries: List[Query]) -> List[QueryResult]:
+    async def query(self, queries: List[Query], **kwargs) -> List[QueryResult]:
         """
         Takes in a list of queries and filters and returns a list of query results with matching document chunks and scores.
         """
@@ -62,10 +68,12 @@ class DataStore(ABC):
             QueryWithEmbedding(**query.dict(), embedding=embedding)
             for query, embedding in zip(queries, query_embeddings)
         ]
-        return await self._query(queries_with_embeddings)
+        return await self._query(queries_with_embeddings, **kwargs)
 
     @abstractmethod
-    async def _query(self, queries: List[QueryWithEmbedding]) -> List[QueryResult]:
+    async def _query(
+        self, queries: List[QueryWithEmbedding], **kwargs
+    ) -> List[QueryResult]:
         """
         Takes in a list of queries with embeddings and filters and returns a list of query results with matching document chunks and scores.
         """
@@ -77,6 +85,7 @@ class DataStore(ABC):
         ids: Optional[List[str]] = None,
         filter: Optional[DocumentMetadataFilter] = None,
         delete_all: Optional[bool] = None,
+        **kwargs
     ) -> bool:
         """
         Removes vectors by ids, filter, or everything in the datastore.
