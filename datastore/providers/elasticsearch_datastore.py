@@ -3,6 +3,7 @@ from typing import Dict, List, Any, Optional
 
 import elasticsearch
 from elasticsearch import Elasticsearch, helpers
+from elasticsearch import NotFoundError
 from loguru import logger
 
 from datastore.datastore import DataStore
@@ -20,8 +21,12 @@ ELASTICSEARCH_CLOUD_ID = os.environ.get("ELASTICSEARCH_CLOUD_ID")
 ELASTICSEARCH_USERNAME = os.environ.get("ELASTICSEARCH_USERNAME")
 ELASTICSEARCH_PASSWORD = os.environ.get("ELASTICSEARCH_PASSWORD")
 ELASTICSEARCH_API_KEY = os.environ.get("ELASTICSEARCH_API_KEY")
-
-ELASTICSEARCH_INDEX = os.environ.get("ELASTICSEARCH_INDEX")
+ELASTICSEARCH_INDEX_PATTERNS = (
+    os.environ.get("ELASTICSEARCH_INDEX_PATTERNS") or "oai-emb-*"
+).split(",")
+ELASTICSEARCH_INDEX_TEMPLATE = (
+    os.environ.get("ELASTICSEARCH_INDEX_TEMPLATE") or "openai-embeddings"
+)
 ELASTICSEARCH_REPLICAS = int(os.environ.get("ELASTICSEARCH_REPLICAS", "1"))
 ELASTICSEARCH_SHARDS = int(os.environ.get("ELASTICSEARCH_SHARDS", "1"))
 
@@ -32,12 +37,12 @@ UPSERT_BATCH_SIZE = 100
 class ElasticsearchDataStore(DataStore):
     def __init__(
         self,
-        index_name: Optional[str] = None,
+        index_template: list = ELASTICSEARCH_INDEX_TEMPLATE,
+        index_patterns: list = ELASTICSEARCH_INDEX_PATTERNS,
         vector_size: int = VECTOR_SIZE,
         similarity: str = "cosine",
         replicas: int = ELASTICSEARCH_REPLICAS,
         shards: int = ELASTICSEARCH_SHARDS,
-        recreate_index: bool = True,
     ):
         """
         Args:
@@ -63,17 +68,20 @@ class ElasticsearchDataStore(DataStore):
             ELASTICSEARCH_PASSWORD,
         )
         assert (
-            index_name != "" or ELASTICSEARCH_INDEX != ""
-        ), "Please provide an index name."
-        self.index_name = index_name or ELASTICSEARCH_INDEX or ""
+            index_patterns and index_template
+        ), "Please provide valid index template and index patterns."
 
         replicas = replicas or ELASTICSEARCH_REPLICAS
         shards = shards or ELASTICSEARCH_SHARDS
 
         # Set up the collection so the documents might be inserted or queried
-        self._set_up_index(vector_size, similarity, replicas, shards, recreate_index)
+        self._set_up_index_template(
+            index_template, index_patterns, vector_size, similarity, replicas, shards
+        )
 
-    async def _upsert(self, chunks: Dict[str, List[DocumentChunk]]) -> List[str]:
+    async def _upsert(
+        self, chunks: Dict[str, List[DocumentChunk]], index_name: str = None
+    ) -> List[str]:
         """
         Takes in a list of document chunks and inserts them into the database.
         Return a list of document ids.
@@ -83,26 +91,29 @@ class ElasticsearchDataStore(DataStore):
             for chunk in chunkList:
                 actions = (
                     actions
-                    + self._convert_document_chunk_to_es_document_operation(chunk)
+                    + self._convert_document_chunk_to_es_document_operation(
+                        index_name, chunk
+                    )
                 )
-
-        self.client.bulk(operations=actions, index=self.index_name)
+        self.client.bulk(operations=actions, index=index_name)
         return list(chunks.keys())
 
     async def _query(
         self,
         queries: List[QueryWithEmbedding],
+        index_name: str = None,
+        embeddings: bool = False,
     ) -> List[QueryResult]:
         """
         Takes in a list of queries with embeddings and filters and returns a list of query results with matching document chunks and scores.
         """
-        searches = self._convert_queries_to_msearch_query(queries)
-        results = self.client.msearch(searches=searches)
+        searches = self._convert_queries_to_msearch_query(index_name, queries)
+        results = self.client.msearch(searches=searches, ignore_unavailable=True)
         return [
             QueryResult(
                 query=query.query,
                 results=[
-                    self._convert_hit_to_document_chunk_with_score(hit)
+                    self._convert_hit_to_document_chunk_with_score(hit, embeddings)
                     for hit in result["hits"]["hits"]
                 ],
             )
@@ -114,6 +125,7 @@ class ElasticsearchDataStore(DataStore):
         ids: Optional[List[str]] = None,
         filter: Optional[DocumentMetadataFilter] = None,
         delete_all: Optional[bool] = None,
+        index_name: str = None,
     ) -> bool:
         """
         Removes vectors by ids, filter, or everything in the datastore.
@@ -125,7 +137,7 @@ class ElasticsearchDataStore(DataStore):
             try:
                 logger.info(f"Deleting all vectors from index")
                 self.client.delete_by_query(
-                    index=self.index_name, query={"match_all": {}}
+                    index=index_name, query={"match_all": {}}, ignore_unavailable=True
                 )
                 logger.info(f"Deleted all vectors successfully")
                 return True
@@ -139,7 +151,9 @@ class ElasticsearchDataStore(DataStore):
         if es_filters != {}:
             try:
                 logger.info(f"Deleting vectors with filter {es_filters}")
-                self.client.delete_by_query(index=self.index_name, query=es_filters)
+                self.client.delete_by_query(
+                    index=index_name, query=es_filters, ignore_unavailable=True
+                )
                 logger.info(f"Deleted vectors with filter successfully")
             except Exception as e:
                 logger.error(f"Error deleting vectors with filter: {e}")
@@ -150,8 +164,9 @@ class ElasticsearchDataStore(DataStore):
                 documents_to_delete = [doc_id for doc_id in ids]
                 logger.info(f"Deleting {len(documents_to_delete)} documents")
                 res = self.client.delete_by_query(
-                    index=self.index_name,
+                    index=index_name,
                     query={"terms": {"metadata.document_id": documents_to_delete}},
+                    ignore_unavailable=True,
                 )
                 logger.info(f"Deleted documents successfully")
             except Exception as e:
@@ -193,7 +208,7 @@ class ElasticsearchDataStore(DataStore):
         return es_filters
 
     def _convert_document_chunk_to_es_document_operation(
-        self, document_chunk: DocumentChunk
+        self, index_name: str, document_chunk: DocumentChunk
     ) -> List[Dict]:
         created_at = (
             to_unix_timestamp(document_chunk.metadata.created_at)
@@ -203,7 +218,7 @@ class ElasticsearchDataStore(DataStore):
 
         action_and_metadata = {
             "index": {
-                "_index": self.index_name,
+                "_index": index_name,
                 "_id": document_chunk.id,
             }
         }
@@ -218,11 +233,13 @@ class ElasticsearchDataStore(DataStore):
 
         return [action_and_metadata, source]
 
-    def _convert_queries_to_msearch_query(self, queries: List[QueryWithEmbedding]):
+    def _convert_queries_to_msearch_query(
+        self, index_name: str, queries: List[QueryWithEmbedding]
+    ):
         searches = []
 
         for query in queries:
-            searches.append({"index": self.index_name})
+            searches.append({"index": index_name})
             searches.append(
                 {
                     "_source": True,
@@ -238,76 +255,53 @@ class ElasticsearchDataStore(DataStore):
 
         return searches
 
-    def _convert_hit_to_document_chunk_with_score(self, hit) -> DocumentChunkWithScore:
+    def _convert_hit_to_document_chunk_with_score(
+        self, hit, embeddings
+    ) -> DocumentChunkWithScore:
         return DocumentChunkWithScore(
             id=hit["_id"],
             text=hit["_source"]["text"],  # type: ignore
             metadata=hit["_source"]["metadata"],  # type: ignore
-            embedding=hit["_source"]["embedding"],  # type: ignore
+            embedding=hit["_source"]["embedding"] if embeddings else None,  # type: ignore
             score=hit["_score"],
         )
 
-    def _set_up_index(
+    def _set_up_index_template(
         self,
+        index_template: str,
+        index_patterns: list,
         vector_size: int,
         similarity: str,
         replicas: int,
         shards: int,
-        recreate_index: bool,
     ) -> None:
-        if recreate_index:
-            self._recreate_index(similarity, vector_size, replicas, shards)
-
         try:
-            index_mapping = self.client.indices.get_mapping(index=self.index_name)
-            current_similarity = index_mapping[self.index_name]["mappings"]["properties"]["embedding"]["similarity"]  # type: ignore
-            current_vector_size = index_mapping[self.index_name]["mappings"]["properties"]["embedding"]["dims"]  # type: ignore
-
-            if current_similarity != similarity:
-                raise ValueError(
-                    f"Collection '{self.index_name}' already exists in Elasticsearch, "
-                    f"but it is configured with a similarity '{current_similarity}'. "
-                    f"If you want to use that collection, but with a different "
-                    f"similarity, please set `recreate_index=True` argument."
-                )
-
-            if current_vector_size != vector_size:
-                raise ValueError(
-                    f"Collection '{self.index_name}' already exists in Elasticsearch, "
-                    f"but it is configured with a vector size '{current_vector_size}'. "
-                    f"If you want to use that collection, but with a different "
-                    f"vector size, please set `recreate_index=True` argument."
-                )
-        except elasticsearch.exceptions.NotFoundError:
-            self._recreate_index(similarity, vector_size, replicas, shards)
-
-    def _recreate_index(
-        self, similarity: str, vector_size: int, replicas: int, shards: int
-    ) -> None:
-        settings = {
-            "index": {
-                "number_of_shards": shards,
-                "number_of_replicas": replicas,
-                "refresh_interval": "1s",
-            }
-        }
-        mappings = {
-            "properties": {
-                "embedding": {
-                    "type": "dense_vector",
-                    "dims": vector_size,
-                    "index": True,
-                    "similarity": similarity,
-                }
-            }
-        }
-
-        self.client.indices.delete(
-            index=self.index_name, ignore_unavailable=True, allow_no_indices=True
-        )
-        self.client.indices.create(
-            index=self.index_name, mappings=mappings, settings=settings
-        )
+            self.client.indices.get_index_template(name=index_template)
+        except NotFoundError:
+            self.client.indices.put_index_template(
+                name=index_template,
+                index_patterns=index_patterns,
+                priority=500,
+                version=1,
+                template={
+                    "settings": {
+                        "number_of_shards": shards,
+                        "number_of_replicas": replicas,
+                        "refresh_interval": "1s",
+                    },
+                    "mappings": {
+                        "_source": {"enabled": True},
+                        "properties": {
+                            "embedding": {
+                                "type": "dense_vector",
+                                "dims": vector_size,
+                                "index": True,
+                                "similarity": similarity,
+                            }
+                        },
+                    },
+                },
+            )
 
 
 def connect_to_elasticsearch(
